@@ -1,0 +1,16 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+*,*::before,*::after{box-sizing:border-box}
+html,body,#root{height:100%;margin:0}
+body{
+  font-family:'Inter',-apple-system,'Segoe UI',system-ui,sans-serif;
+  background:
+    radial-gradient(ellipse 120% 80% at 0% 0%,   #dce8ff 0%, transparent 55%),
+    radial-gradient(ellipse 90%  70% at 100% 100%,#e8d6ff 0%, transparent 55%),
+    radial-gradient(ellipse 80%  60% at 50%  50%,  #f0f8ff 0%, transparent 70%),
+    #f7f9ff;
+  background-attachment:fixed;
+  color:#1a1a2e;
+  -webkit-font-smoothing:antialiased;
+  min-height:100%;
+}
