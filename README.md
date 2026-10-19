@@ -1,4 +1,7 @@
+
 # PriceRadar — price intelligence platform
+
+A web application to track the price drops on platforms like Amazon and Flipkart.
 
 Paste a product link → PriceRadar identifies it, tracks its price in a database, compares verified offers across retailers, charts the recorded history, explains whether now is a good time to buy, and emails you when your alert rules fire.
 
@@ -6,4 +9,6 @@ Paste a product link → PriceRadar identifies it, tracks its price in a databas
 - `Frontend/` React + Recharts UI (monochrome glassmorphism)
 - `legacy/` the original single-file app, kept for reference
 
-**Security note:** the originally uploaded `Backend/.env` contained mail credentials. It is now git-ignored, but treat that password as exposed — rotate the Gmail App Password.
+
+
+
