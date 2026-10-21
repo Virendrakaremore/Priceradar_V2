@@ -161,6 +161,7 @@ def product_summary(p: Product, sub: Subscription | None = None) -> dict:
     verdict = analytics.classify(st)
     rules = sess().scalars(select(AlertRule).where(AlertRule.product_id == p.id)).all()
     return {"id": p.id, "title": p.title, "brand": p.brand, "image_url": p.image_url, "paused": bool(sub and sub.paused),
+            "track_until": iso(sub.track_until) if sub and sub.track_until else None,
             "created_at": iso(p.created_at), "retailers": sorted({o.retailer.name for o in offers if o.match_status != "possible"}),
             "best_offer": offer_json(best) if best else None,
             "source_offer": offer_json(src) if src else None,
@@ -308,15 +309,40 @@ def update_product(pid):
     own_product(pid)
     user = get_user(sess(), cfg())
     body = request.get_json(silent=True) or {}
-    if "paused" not in body or not isinstance(body["paused"], bool):
-        err("validation_error", "paused (boolean) is required")
     sub = sess().scalars(select(Subscription).where(Subscription.user_id == user.id, Subscription.product_id == pid)).one()
-    sub.paused = body["paused"]
+
+    if "paused" in body:
+        if not isinstance(body["paused"], bool):
+            err("validation_error", "paused (boolean) is required")
+        sub.paused = body["paused"]
+
+    # Support track_duration_minutes (15, 30, 60, 120, 1440, 2880) or custom track_until ISO
+    if "track_duration_minutes" in body:
+        mins = body["track_duration_minutes"]
+        if mins is None or mins == 0:
+            sub.track_until = None
+        else:
+            try:
+                sub.track_until = utcnow() + timedelta(minutes=int(mins))
+                sub.paused = False # Resume tracking when setting duration
+            except (ValueError, TypeError):
+                err("validation_error", "track_duration_minutes must be an integer or null")
+    elif "track_until" in body:
+        if body["track_until"] is None:
+            sub.track_until = None
+        else:
+            from datetime import datetime
+            try:
+                sub.track_until = as_utc(datetime.fromisoformat(body["track_until"].replace("Z", "+00:00")))
+                sub.paused = False
+            except Exception:
+                err("validation_error", "track_until must be a valid ISO timestamp or null")
+
     for o in sess().scalars(select(Offer).where(Offer.product_id == pid, Offer.match_status.in_(("source", "verified")))):
         o.monitoring_enabled = not sub.paused
         if not sub.paused: o.next_check_at = utcnow()
     sess().commit()
-    return jsonify({"success": True, "paused": sub.paused})
+    return jsonify({"success": True, "paused": sub.paused, "track_until": iso(sub.track_until) if sub.track_until else None})
 
 
 @bp.post("/api/v1/products/<int:pid>/refresh")
@@ -327,6 +353,62 @@ def refresh_product(pid):
         o.next_check_at = utcnow(); n += 1
     sess().commit()
     return jsonify({"success": True, "queued_offers": n, "note": "The monitoring worker will check these shortly."})
+
+
+def _run_rediscover(app, product_id: int):
+    """Background task: re-run discovery for an already-tracked product."""
+    from .discovery import default_providers
+    from .tracking import identify as _identify
+    with app.app_context():
+        s = app.config["SESSION_FACTORY"]()
+        try:
+            p = s.get(Product, product_id)
+            if not p:
+                return
+            from . import matching
+            src_attrs = matching.extract_attrs(p.title, p.brand, p.model, p.gtin)
+            from .discovery import build_query
+            query = build_query(src_attrs.brand, src_attrs.model_codes, p.title)
+            # Find which retailer is the source offer so we skip it in discovery
+            src_offer = s.scalars(
+                select(Offer).where(Offer.product_id == product_id, Offer.match_status == "source")
+            ).first()
+            exclude_key = src_offer.retailer.key if src_offer else ""
+            fetcher = app.config["FETCHER"]
+            providers = app.config.get("PROVIDERS") or default_providers(fetcher)
+            all_cands = []
+            for prov in providers:
+                try:
+                    found, _ = prov.discover(query, exclude_key)
+                    all_cands += found
+                except Exception as exc:
+                    log.warning("rediscover provider %s failed: %s", prov.name, exc)
+            from .tracking import add_candidate
+            for c in all_cands:
+                try:
+                    add_candidate(s, app.config["SETTINGS"], fetcher, p, c.retailer_key, c.url, c.provider,
+                                  src_attrs, p.title)
+                except Exception:
+                    pass
+            s.commit()
+        except Exception:
+            log.exception("rediscover job failed for product %s", product_id)
+        finally:
+            s.close()
+
+
+@bp.post("/api/v1/products/<int:pid>/rediscover")
+def rediscover_product(pid):
+    """Re-run the cross-retailer discovery pipeline for an already-tracked product.
+    Returns immediately; discovery runs in the background thread pool.
+    """
+    p = own_product(pid)
+    app = current_app._get_current_object()
+    app.config["JOB_POOL"].submit(_run_rediscover, app, pid)
+    return jsonify({
+        "success": True,
+        "message": "Cross-retailer discovery started in the background. Refresh the page in ~30 seconds to see new results.",
+    }), 202
 
 
 @bp.post("/api/v1/products/<int:pid>/offers")
@@ -376,13 +458,71 @@ def history(pid):
                          for r in analytics.bucketize([p for p in pts if p.retailer == n], b)]
     rows = analytics.bucketize(pts, b)
     st = analytics.compute_stats(pts, now) if pts else {"count": 0}
+    
+    # Raw recent un-bucketed samples (for the 15-second tracking live graph)
+    raw_samples = [
+        {"t": int(p.t.timestamp() * 1000), "price": str(p.price), "retailer": p.retailer}
+        for p in pts[-50:]  # Latest 50 checks
+    ]
+
+    # Find external identifier for all-time Amazon/Flipkart history
+    p_obj = sess().get(Product, pid)
+    amazon_asin = None
+    flipkart_pid = None
+    offers = sess().scalars(select(Offer).where(Offer.product_id == pid)).all()
+    for o in offers:
+        if o.retailer.key == "amazon" and o.external_id:
+            amazon_asin = o.external_id
+        elif o.retailer.key == "flipkart" and o.external_id:
+            flipkart_pid = o.external_id
+
+    # If this is an Amazon product, provide the official all-time Keepa price history image URL
+    all_time_meta = {
+        "amazon_asin": amazon_asin,
+        "flipkart_pid": flipkart_pid,
+        "keepa_image_url": f"/api/v1/products/{pid}/all-time-graph" if amazon_asin else None,
+        "has_all_time": bool(amazon_asin)
+    }
+
     return jsonify({"success": True, "range": rng, "bucket_seconds": int(b.total_seconds()) if b else None,
                     "points": [{**r, "price": str(r["price"]), "min": str(r["min"]), "max": str(r["max"]),
                                 **({"avg": str(r["avg"])} if "avg" in r else {})} for r in rows],
+                    "raw_samples": raw_samples,
+                    "all_time_meta": all_time_meta,
                     "series": series, "retailers": sorted({p.retailer for p in all_pts}),
                     "stats": {k: (str(v) if isinstance(v, Decimal) else v) for k, v in st.items()},
                     "provenance": "Observations collected by PriceRadar monitoring; no imported or estimated data.",
-                    "insufficient": len(all_pts) < 2})
+                    "insufficient": len(all_pts) < 1})
+
+
+@bp.get("/api/v1/products/<int:pid>/all-time-graph")
+def get_all_time_graph(pid):
+    """Proxy real all-time Amazon price history chart from Keepa with caching and fallback."""
+    import requests
+    from flask import Response
+    p = own_product(pid)
+    offers = sess().scalars(select(Offer).where(Offer.product_id == pid)).all()
+    asin = None
+    for o in offers:
+        if o.retailer.key == "amazon" and o.external_id:
+            asin = o.external_id
+            break
+    if not asin:
+        return jsonify({"error": "No Amazon ASIN available for this product"}), 404
+
+    # Keepa price history image: amazon=1 (Amazon direct), new=1 (New 3rd party), bb=1 (BuyBox)
+    keepa_url = f"https://graph.keepa.com/pricehistory.png?asin={asin}&domain=in&amazon=1&new=1&bb=1&range=0&width=860&height=320"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)",
+        "Referer": "https://keepa.com/"
+    }
+    try:
+        r = requests.get(keepa_url, headers=headers, timeout=12)
+        if r.status_code == 200 and r.content[:8] == b'\x89PNG\r\n\x1a\n':
+            return Response(r.content, mimetype="image/png", headers={"Cache-Control": "public, max-age=3600"})
+        return jsonify({"error": f"Upstream returned status {r.status_code}"}), 502
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
 
 
 @bp.get("/api/v1/products/<int:pid>/insights")
@@ -566,9 +706,39 @@ def dashboard():
             savings += Decimal(pr["current_price"]) - r.target_price
     notes = sess().scalars(select(NotificationEvent).where(NotificationEvent.user_id == user.id).order_by(NotificationEvent.id.desc()).limit(5)).all()
     recent = sess().scalars(select(Offer).where(Offer.last_success_at.is_not(None), Offer.match_status.in_(("source", "verified"))).order_by(Offer.last_success_at.desc()).limit(6)).all()
+    
+    # Advanced dashboard extra stats
+    active_monitors = sum(1 for it in items if not it.get("paused"))
+    paused_monitors = len(items) - active_monitors
+    
+    total_val = Decimal(0)
+    lowest_drop_pct = Decimal(0)
+    store_counts = {}
+    
+    for it in items:
+        if it.get("current_price"):
+            try:
+                total_val += Decimal(it["current_price"])
+            except Exception:
+                pass
+        for r in it.get("retailers", []):
+            store_counts[r] = store_counts.get(r, 0) + 1
+        st = it.get("stats", {})
+        ch_pct = st.get("change_7d_pct")
+        if ch_pct is not None:
+            try:
+                d_pct = Decimal(ch_pct)
+                if d_pct < lowest_drop_pct:
+                    lowest_drop_pct = d_pct
+            except Exception:
+                pass
+
     return jsonify({"success": True, "tracked_products": len(items), "active_alerts": len(rules),
+                    "active_monitors": active_monitors, "paused_monitors": paused_monitors,
+                    "portfolio_value": str(total_val), "max_savings_pct": str(abs(lowest_drop_pct)),
+                    "store_counts": store_counts,
                     "confirmed_price_drops_7d": len(drops), "potential_savings_to_targets": str(savings),
-                    "recent_products": items[:5], "price_drops": sorted(drops, key=lambda d: Decimal(d["change"]))[:5],
+                    "recent_products": items[:6], "price_drops": sorted(drops, key=lambda d: Decimal(d["change"]))[:6],
                     "recent_offers": [offer_json(o) | {"product_id": o.product_id} for o in recent],
                     "recent_notifications": [{"id": n.id, "event_type": n.event_type, "status": n.status, "product_name": n.payload.get("product_name"),
                                               "created_at": iso(n.created_at)} for n in notes],

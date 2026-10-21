@@ -1,11 +1,19 @@
 from __future__ import annotations
 from urllib.parse import urlparse
 from .base import ExtractionError, ParsedOffer, RetailerAdapter
-from .sites import AmazonIN, Croma, Flipkart, RelianceDigital, TataCliq, VijaySales
+from .sites import AmazonIN, Croma, Flipkart, JioMart, RelianceDigital, TataCliq, VijaySales
 
 # Myntra and Ajio are intentionally not registered: they are apparel marketplaces whose catalogue
 # data we have no verified access path for. Add an adapter here when one exists.
-ADAPTERS: list[RetailerAdapter] = [AmazonIN(), Flipkart(), Croma(), RelianceDigital(), VijaySales(), TataCliq()]
+ADAPTERS: list[RetailerAdapter] = [
+    AmazonIN(),
+    Flipkart(),
+    Croma(),
+    RelianceDigital(),
+    VijaySales(),
+    TataCliq(),
+    JioMart(),
+]
 
 def adapter_for_host(host: str) -> RetailerAdapter | None:
     return next((a for a in ADAPTERS if a.matches(host)), None)

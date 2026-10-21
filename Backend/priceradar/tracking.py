@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import concurrent.futures
 from datetime import timedelta
 from decimal import Decimal
 
@@ -17,6 +18,11 @@ from .retailers import ExtractionError, adapter_by_key, adapter_for_url, allowed
 from .retailers.base import ParsedOffer, RetailerAdapter
 from .security import UrlRejected, extract_url, resolve_redirects
 from .timeutil import utcnow
+
+# Maximum seconds to wait for a single candidate page fetch during discovery
+_CANDIDATE_TIMEOUT = 30
+# How many candidate pages to fetch in parallel during the matching stage
+_CANDIDATE_WORKERS = 4
 
 log = logging.getLogger("priceradar.tracking")
 
@@ -39,7 +45,7 @@ def get_user(session, settings: Settings) -> User:
 
 
 def fetch_and_parse(adapter: RetailerAdapter, url: str, fetcher: Fetcher, use_browser: bool = True) -> tuple[ParsedOffer, str]:
-    """HTTP first (cheap); fall back to a rendered page when the HTTP result has no price."""
+    """HTTP first (cheap); fall back to a rendered page when the HTTP result has no price or is blocked."""
     last: ExtractionError | None = None
     parsed = None
     for render in (False, True) if use_browser else (False,):
@@ -52,6 +58,9 @@ def fetch_and_parse(adapter: RetailerAdapter, url: str, fetcher: Fetcher, use_br
             last = e
             if e.category in ("not_found", "unsupported") or (render and e.category == "blocked"):
                 raise
+    if parsed is not None:
+        return parsed, url        # page parsed, but no price (e.g. out of stock)
+    raise last or ExtractionError("parse", "Could not read the product page.")
     if parsed is not None:
         return parsed, url        # page parsed, but no price (e.g. out of stock)
     raise last or ExtractionError("parse", "Could not read the product page.")
@@ -94,6 +103,16 @@ def identify(session, settings: Settings, fetcher: Fetcher, raw_input: str, prov
         session.commit()
         return existing.product, ["This product was already being tracked."]
 
+    # PAUSE ALL PREVIOUS PRODUCTS for this user so only the current product is monitored actively!
+    # This prevents platforms from banning the user's IP due to background requests on all old items.
+    for prev_sub in session.scalars(select(Subscription).where(Subscription.user_id == user.id)):
+        prev_sub.paused = True
+    for prev_offer in session.scalars(
+        select(Offer).join(Subscription, Subscription.product_id == Offer.product_id)
+        .where(Subscription.user_id == user.id)
+    ):
+        prev_offer.monitoring_enabled = False
+
     progress("extracting")
     try:
         parsed, final = fetch_and_parse(ad, url, fetcher, settings.use_playwright)
@@ -115,23 +134,68 @@ def identify(session, settings: Settings, fetcher: Fetcher, raw_input: str, prov
 
     progress("discovering")
     query = build_query(a.brand or parsed.brand, a.model_codes, parsed.title or "")
+    log.info("discovery query: %r (brand=%r model_codes=%r)", query, a.brand, a.model_codes)
     cands = []
     for prov in providers:
         try:
             found, warns = prov.discover(query, ad.key)
-            cands += found; warnings += warns
-        except Exception as e:  # a provider must never sink the whole request
+            log.info("provider %s found %d candidates, %d warnings", prov.name, len(found), len(warns))
+            cands += found
+            warnings += warns
+        except Exception as e:
             log.warning("provider %s failed: %s", prov.name, type(e).__name__)
             warnings.append(f"Discovery provider '{prov.name}' failed.")
+
     progress("matching")
-    for c in cands:
+    verified_count = 0
+    possible_count = 0
+
+    # Fetch and match candidates in parallel to speed up the pipeline
+    def _try_candidate(c):
         try:
-            add_candidate(session, settings, fetcher, product, c.retailer_key, c.url, c.provider, a, parsed.title or "")
+            return add_candidate(
+                session, settings, fetcher, product,
+                c.retailer_key, c.url, c.provider, a, parsed.title or "",
+            )
         except (ExtractionError, UrlRejected) as e:
-            warnings.append(f"{c.retailer_key}: candidate skipped ({getattr(e, 'category', getattr(e, 'code', 'error'))}).")
+            cat = getattr(e, "category", getattr(e, "code", "error"))
+            return cat  # signal failure with a string
+
+    # Use threads so multiple HTTP fetches happen concurrently (DB writes are still serial)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=_CANDIDATE_WORKERS) as pool:
+        futures = {pool.submit(_try_candidate, c): c for c in cands}
+        for fut in concurrent.futures.as_completed(futures, timeout=120):
+            c = futures[fut]
+            try:
+                result = fut.result()
+            except Exception as e:
+                warnings.append(f"{c.retailer_key}: candidate skipped (unexpected error: {type(e).__name__}).")
+                continue
+            if isinstance(result, str):
+                # Error category string returned by _try_candidate
+                warnings.append(f"{c.retailer_key}: candidate skipped ({result}).")
+            elif isinstance(result, Offer):
+                if result.match_status == "verified":
+                    verified_count += 1
+                elif result.match_status == "possible":
+                    possible_count += 1
+
     session.commit()
+
     if not cands:
-        warnings.append("No other retailers were found automatically. You can add the same product's link from another store.")
+        warnings.append(
+            "No other retailer listings were found automatically. "
+            "You can manually add the same product's URL from another store using the 'Add retailer' button on the product page."
+        )
+    elif verified_count == 0 and possible_count == 0:
+        warnings.append(
+            f"Found {len(cands)} candidate listings across other retailers but none matched "
+            "the product specification. You can manually add the correct URL from another store."
+        )
+    else:
+        log.info("discovery complete: %d verified, %d possible out of %d candidates",
+                 verified_count, possible_count, len(cands))
+
     return product, warnings
 
 
@@ -149,18 +213,33 @@ def add_candidate(session, settings, fetcher, product: Product, retailer_key: st
     src_title = src_title or product.title
     src_attrs = src_attrs or matching.extract_attrs(product.title, product.brand, product.model, product.gtin)
     res = matching.compare(src_attrs, src_title, _attrs(parsed), parsed.title or "")
+    log.info(
+        "match %s %r → %s (score=%.3f) reasons=%s",
+        retailer_key, (parsed.title or "")[:60], res.status, res.score, res.reasons,
+    )
     mc = MatchCandidate(product_id=product.id, retailer_key=ad.key, url=parsed.canonical_url, title=parsed.title,
                         score=res.score, status=res.status, reasons=res.reasons, provider=provider)
     session.add(mc)
     if res.status == "rejected":
-        session.flush(); return mc
+        session.flush()
+        return mc
     offer = _make_offer(session, product, ad, parsed, url, res.status, res.score, res.reasons, settings)
     if res.status == "verified":
+        # Fully monitored: record first price observation and schedule regular checks
         record_success(session, offer, parsed, settings)
-    else:  # alternatives show their discovery-time price only, labelled; no history, no monitoring
-        offer.current_price, offer.mrp, offer.availability = parsed.price, parsed.mrp, parsed.availability
+    elif res.status == "possible":
+        # "Possible" matches are shown in the comparison panel with a disclaimer.
+        # We DO monitor them so the user gets live prices, but only at half the normal rate.
+        offer.current_price = parsed.price
+        offer.mrp = parsed.mrp
+        offer.availability = parsed.availability
         offer.last_success_at = offer.last_checked_at = utcnow()
         offer.status = "ok" if parsed.price else "unavailable"
+        # Monitor at reduced frequency — still useful, just not fully verified
+        offer.monitoring_enabled = True
+        half_interval = max((settings.monitor_interval_s or 900) * 2, 1800)
+        offer.check_interval_s = half_interval
+        offer.next_check_at = utcnow() + timedelta(seconds=half_interval)
     return offer
 
 

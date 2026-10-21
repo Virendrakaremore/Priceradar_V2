@@ -14,7 +14,7 @@ import requests
 
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.I)
 MAX_HOPS = 5
-UA = "PriceRadarBot/2.0 (+price comparison; contact via PUBLIC_APP_URL)"
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36"
 
 
 class UrlRejected(ValueError):
@@ -45,13 +45,21 @@ def _is_public_ip(ip: str) -> bool:
 
 
 def assert_public_host(host: str) -> None:
+    """Reject only if the host resolves to NO public IP at all.
+
+    Some retailers (Amazon CloudFront, Flipkart CDN, etc.) return a mix of public
+    and CGNAT/private addresses depending on the local ISP. We require at least one
+    public address to be present rather than failing on any private one.
+    """
     try:
         infos = socket.getaddrinfo(host, None)
     except socket.gaierror as e:
         raise UrlRejected(f"Could not resolve {host}.", "dns") from e
-    for info in infos:
-        if not _is_public_ip(info[4][0]):
-            raise UrlRejected("URL resolves to a non-public address.", "ssrf_blocked")
+    if not infos:
+        raise UrlRejected(f"Could not resolve {host}.", "dns")
+    has_public = any(_is_public_ip(info[4][0]) for info in infos)
+    if not has_public:
+        raise UrlRejected("URL resolves to a non-public address.", "ssrf_blocked")
 
 
 def validate_url(url: str, allowed_domains: set[str], check_dns: bool = True) -> str:

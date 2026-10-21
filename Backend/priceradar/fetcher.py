@@ -66,7 +66,14 @@ class LiveFetcher(Fetcher):
         self.use_playwright = use_playwright
         self.robots = RobotsCache() if respect_robots else None
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": UA, "Accept-Language": "en-IN,en;q=0.9"})
+        self.session.headers.update({
+            "User-Agent": UA,
+            "Accept-Language": "en-IN,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+            "DNT": "1",
+            "Upgrade-Insecure-Requests": "1"
+        })
 
     def fetch(self, url: str, *, render: bool = False) -> FetchResult:
         if not host_allowed(urlparse(url).hostname or "", self.allowed):

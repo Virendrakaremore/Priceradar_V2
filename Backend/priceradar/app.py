@@ -26,10 +26,11 @@ class RedactFilter(logging.Filter):
 
 
 def create_app(settings: Settings | None = None, *, fetcher: Fetcher | None = None, providers=None,
-               create_tables: bool = False, smtp_sender=None, check_dns: bool = True) -> Flask:
+               create_tables: bool = False, smtp_sender=None, check_dns: bool | None = None) -> Flask:
     s = settings or get_settings()
     app = Flask(__name__)
-    app.config.update(SETTINGS=s, MAX_CONTENT_LENGTH=s.max_content_length, CHECK_DNS=check_dns, SMTP_SENDER=smtp_sender)
+    effective_check_dns = s.check_dns if check_dns is None else check_dns
+    app.config.update(SETTINGS=s, MAX_CONTENT_LENGTH=s.max_content_length, CHECK_DNS=effective_check_dns, SMTP_SENDER=smtp_sender)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     logging.getLogger().addFilter(RedactFilter())
     engine = make_engine(s.database_url)

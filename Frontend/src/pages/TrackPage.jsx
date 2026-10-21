@@ -4,7 +4,12 @@ import { Chip, Empty, ErrorBox, Glass, PageHead } from "../components/ui";
 import { inr } from "../format";
 import { go, useApi } from "../hooks";
 
-const STAGES = [["resolving", "Resolving link"], ["extracting", "Identifying product"], ["discovering", "Searching other retailers"], ["matching", "Verifying matches"]];
+const STAGES = [
+  { key: "resolving", label: "Resolving link", icon: "🔗", hint: "Unshortening & DNS check" },
+  { key: "extracting", label: "Identifying product", icon: "📦", hint: "Extracting title & specs" },
+  { key: "discovering", label: "Searching other retailers", icon: "🔍", hint: "Amazon, Flipkart, Croma..." },
+  { key: "matching", label: "Verifying matches", icon: "⚡", hint: "Cross-store price comparison" }
+];
 
 export default function TrackPage() {
   const [text, setText] = useState(() => { try { const v = sessionStorage.getItem("pr_prefill") || ""; sessionStorage.removeItem("pr_prefill"); return v; } catch { return ""; } });
@@ -38,7 +43,8 @@ export default function TrackPage() {
   };
   const cancel = () => { cancelled.current = true; setBusy(false); setJob(null); };
   const paste = async () => { try { setText(await navigator.clipboard.readText()); } catch { setError({ message: "Clipboard access was blocked — paste with Ctrl/⌘+V instead." }); } };
-  const idx = job ? STAGES.findIndex(([k]) => k === job.stage) : -1;
+  const idx = job ? STAGES.findIndex((s) => s.key === job.stage) : -1;
+  const progressPercent = idx < 0 ? 10 : Math.min(100, Math.round(((idx + 0.6) / STAGES.length) * 100));
 
   return (
     <>
@@ -52,9 +58,37 @@ export default function TrackPage() {
           </div>
         </form>
         {busy && (
-          <ol className="stages" aria-live="polite">
-            {STAGES.map(([k, l], i) => <li key={k} className={i < idx ? "done" : i === idx ? "now" : ""}>{i < idx ? "✓" : i === idx ? "●" : "○"} {l}</li>)}
-          </ol>
+          <div className="stage-tracker" aria-live="polite">
+            <div className="stage-tracker-header">
+              <div className="stage-tracker-title">
+                <span className="stage-radar-dot" aria-hidden="true" />
+                <span>
+                  {idx >= 0 ? STAGES[idx].label : "Initiating tracking..."}
+                </span>
+              </div>
+              <span className="stage-percent">{progressPercent}%</span>
+            </div>
+
+            <div className="stage-progress-bar-wrap" role="progressbar" aria-valuenow={progressPercent} aria-valuemin="0" aria-valuemax="100">
+              <div className="stage-progress-bar-fill" style={{ width: `${progressPercent}%` }} />
+            </div>
+
+            <div className="stage-steps">
+              {STAGES.map((s, i) => {
+                const isDone = i < idx;
+                const isActive = i === idx;
+                return (
+                  <div key={s.key} className={`stage-step-card ${isDone ? "done" : ""} ${isActive ? "active" : ""}`}>
+                    <div className="stage-icon-bubble">
+                      {isDone ? "✓" : isActive ? s.icon : (i + 1)}
+                    </div>
+                    <div className="stage-label">{s.label}</div>
+                    <div className="stage-hint">{s.hint}</div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
         )}
         <ErrorBox error={error} />
         {job?.warnings?.length > 0 && !busy && <div className="notice notice-warn">{job.warnings.join(" ")}</div>}

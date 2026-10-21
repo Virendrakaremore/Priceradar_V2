@@ -69,6 +69,7 @@ class Settings:
     big_jump_pct: Decimal = field(default_factory=lambda: Decimal(os.environ.get("BIG_JUMP_PERCENT", "40")))
     use_playwright: bool = field(default_factory=lambda: _bool("USE_PLAYWRIGHT", True))
     respect_robots: bool = field(default_factory=lambda: _bool("RESPECT_ROBOTS", True))
+    check_dns: bool = field(default_factory=lambda: not _bool("DISABLE_DNS_CHECK", False))
     job_workers: int = field(default_factory=lambda: _int("JOB_WORKERS", 2))
     run_jobs_inline: bool = field(default_factory=lambda: _bool("RUN_JOBS_INLINE", False))
 

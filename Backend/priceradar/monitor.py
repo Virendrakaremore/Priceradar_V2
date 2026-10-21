@@ -38,6 +38,21 @@ class Monitor:
         now = utcnow()
         claimed: list[int] = []
         with self.sf() as s:
+            # Auto-expire subscriptions whose track_until has passed
+            expired_subs = s.scalars(
+                select(Subscription).where(
+                    Subscription.paused.is_(False),
+                    Subscription.track_until.is_not(None),
+                    Subscription.track_until <= now
+                )
+            ).all()
+            for sub in expired_subs:
+                sub.paused = True
+                for o in s.scalars(select(Offer).where(Offer.product_id == sub.product_id)):
+                    o.monitoring_enabled = False
+            if expired_subs:
+                s.commit()
+
             q = (select(Offer).where(Offer.monitoring_enabled.is_(True),
                                      or_(Offer.next_check_at.is_(None), Offer.next_check_at <= now),
                                      or_(Offer.circuit_open_until.is_(None), Offer.circuit_open_until <= now),
